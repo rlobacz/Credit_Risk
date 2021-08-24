@@ -1,0 +1,1493 @@
+---
+title: "Comparing best practices to machine learning model"
+author: Rafał Łobacz
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+<style>
+body {
+text-align: justify}
+</style>
+
+
+# Introduction
+
+In this project we will try to compare model built using best practices in credit risk modeling and another model built in ordinary way. Data that we use comes from kaggle repository 
+[link](https://www.kaggle.com/urstrulyvikas/lending-club-loan-data-analysis ) and include information about borrower from Lending Club company. It is relatively small - 9578 rows x 14 columns. We will try to predict whether or not a loan will be default. Project is divided into 3 parts. In the first one we prepare data for further usage. In the second one we use caret library to build multiple models like xgboost, random forest, neural network or linear discriminant analysis. We select the model that perform the best on cross-validation and test data to use it later for comparison. In the last part we built best practices logit model and we compare it with previously selected one. Comparison will be done using tests, counting statistics and by checking variables stability.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo    = TRUE, 
+                      cache   = TRUE,
+                      message = FALSE, 
+                      warning = FALSE)
+options(scipen = 10)
+```
+
+# Data preparation
+
+Reading libraries
+```{r}
+library(tidyverse)
+library(car)
+library(pROC)
+library(lmtest)
+library(caret)
+library(DMwR)
+library(randomForest)
+
+```
+
+Reading data and checking glimpse of variables. 
+```{r}
+df <- read.csv('loan_data.csv')
+glimpse(df)
+```
+
+Dataset columns and definition:
+
+credit.policy: 1 if the customer meets the credit underwriting criteria of LendingClub.com, and 0 otherwise.\
+purpose: The purpose of the loan (takes values "creditcard", "debtconsolidation", "educational", "majorpurchase", "smallbusiness", and "all_other").\
+int.rate: The interest rate of the loan, as a proportion (a rate of 11% would be stored as 0.11). Borrowers judged by LendingClub.com to be more risky are assigned higher interest rates.\
+installment: The monthly installments owed by the borrower if the loan is funded.\
+log.annual.inc: The natural log of the self-reported annual income of the borrower.\
+dti: The debt-to-income ratio of the borrower (amount of debt divided by annual income).\
+fico: The FICO credit score of the borrower.\
+days.with.cr.line: The number of days the borrower has had a credit line.\
+revol.bal: The borrower's revolving balance (amount unpaid at the end of the credit card billing cycle).\
+revol.util: The borrower's revolving line utilization rate (the amount of the credit line used relative to total credit available).\
+inq.last.6mths: The borrower's number of inquiries by creditors in the last 6 months.\
+delinq.2yrs: The number of times the borrower had been 30+ days past due on a payment in the past 2 years.\
+pub.rec: The borrower's number of derogatory public records (bankruptcy filings, tax liens, or judgments).\
+
+Firstly we will delete credit.policy. This variable is based on some model and we do not want to use in modelling variable that was created by another model. Moreover, we change name of our explainable variable - not.fully.paid to default and we convert it to factor.
+```{r}
+df <- df[,-1]
+df <- df %>% dplyr::rename(default=not.fully.paid)
+df$default <- factor(ifelse(df$default==1,"YES","NO"))
+```
+
+Let`s now check number of unique values in each variable.
+```{r}
+sapply(df, 
+        function(x) 
+          unique(x) %>% 
+          length()) %>% 
+  sort()
+```
+
+Let`s check pub.rec.
+```{r}
+table(df$pub.rec)
+```
+
+We can see that it does not have to many values above 2. We will merge them into 1.
+```{r}
+df$pub.rec <- ifelse(df$pub.rec>=1,'1+','0')
+df$pub.rec <- as.factor(df$pub.rec)
+```
+
+Let`s look at purpose now.
+```{r}
+table(df$purpose)
+```
+
+Everything looks ok we will do nothing.
+```{r}
+df$purpose <- as.factor(df$purpose)
+```
+
+Let`s look at delinq.2yrs now.
+```{r}
+table(df$delinq.2yrs)
+```
+
+Situation is similar to pub.rec. We will merge everything greater than 2 to 2+.
+```{r}
+df$delinq.2yrs <- ifelse(df$delinq.2yrs>=2,'2+',ifelse(df$delinq.2yrs==1,'1','0'))
+df$delinq.2yrs <- as.factor(df$delinq.2yrs)
+```
+
+All the other variable look ok to us. We checked the distribution of numeric variables. Many of them are not normally distributed. Using log(x) oe log(1+x) did not improve anything, so we left all of them in basic form. Moreover, we did not spot any substantial outliers and missing values.\
+As our data is ready to use, we will partition it into 70% train and 30% test. We will us them in future modelling.
+```{r}
+set.seed(987654321)
+#splitting data
+data_which_train <- createDataPartition(df$default, # target variable
+                                          # share of the training sample
+                                          p = 0.7, 
+                                          # should result be a list?
+                                          list = FALSE)
+df_train <- df[data_which_train,]
+df_test <- df[-data_which_train,]
+summary(df_train$default)/nrow(df_train)
+summary(df_test$default)/nrow(df_test)
+```
+
+# Building best mahine learning model
+
+## Feature Selection & data transformation
+
+Feature selection will be done using Random Forest variable importance with gini statistic.
+```{r}
+set.seed(987654321)
+#fitting random forest on train data
+rf_model <- randomForest(default~.,df_train)
+#checking variable improtance using GINI
+importance(rf_model) %>% 
+  data.frame() %>% arrange(desc(MeanDecreaseGini))
+
+```
+
+We can see that pub.rec and deling.2yrs are much less important than other variables. Let`s firstly explore pub.rec variable.
+
+```{r}
+plot(table(df_train$pub.rec,df_train$default),main='default~pub.rec')
+```
+
+We can see that the difference in defaults are a little bit bigger in 1+, we will keep this variable as it will not increase too much degrees of freedom and we do not have to many variables. Maybe it will be useful.\
+Now let`s check delinq.2yrs.
+
+```{r}
+plot(table(df_train$delinq.2yrs,df_train$default),main='default~deling.2yrs')
+```
+
+We can see that there is almost no difference between 0, 1 and 2+. We will not use this variable in modelling.\
+Let`s also check purpose.
+
+```{r}
+plot(table(df_train$purpose,df_train$default),main='default~purpose')
+```
+
+There are some differences among each purpose. We decided to merge all levels and leave small_business alone. This will improve time of computing our models.
+
+```{r}
+#deleting delinq.2yrs
+df_train <- df_train %>% select(-c('delinq.2yrs'))
+#merging purpose in train and test
+df_train$purpose <- ifelse(df_train$purpose=='small_business','small_business','other')
+df_train$purpose <- as.factor(df_train$purpose)
+df_test$purpose <- ifelse(df_test$purpose=='small_business','small_business','other')
+df_test$purpose <- as.factor(df_test$purpose)
+
+```
+
+Let`s now analyse if there are collinearities among predictors.
+```{r}
+train_numeric_vars <- 
+  # check if variable is numeric
+  sapply(df_train, is.numeric) %>% 
+  # select those which are
+  which() %>% 
+  # and keep just their names
+  names()
+
+#counting and plotting correlations
+train_correlations <- 
+    cor(df_train[,train_numeric_vars],
+        use = "pairwise.complete.obs")
+corrplot::corrplot.mixed(train_correlations,
+               upper = "square",
+               lower = "number",
+               tl.col="black", # color of labels (variable names)
+               tl.pos = "lt")
+```
+
+We can see that int.rate is correlated with fico. But because we have few variables we will keep them both. Also, this correlation is not very high.\
+Having train data fully prepared we will now move to training. We will use 5-Fold Cross-Validation 3 times. We want to maximize AUC.
+
+```{r}
+options(contrasts = c("contr.treatment",  # for non-ordinal factors
+                      "contr.treatment")) # for ordinal factors
+#setting up cross-validation 
+ctrl_cv5x3 <- trainControl(method = "repeatedcv",
+                           number = 5,
+                           repeats = 3,
+                         classProbs = TRUE,
+                        # sampling = 'smote',
+                        summaryFunction = twoClassSummary)
+```
+
+
+## Training
+
+We are going to train 8 models. Process of training is pretty much the same for all of them. We use caret train function and appropriate method name. Some of them might include tuning parameters. We are going to make comments only to the first method what each line of code do. We train neural network model, 4 tree based models, logit, partial least square and linear discriminant analysis. Based on the cross-validation and test AUC we will choose the best one to compare with best practices model made in next chapter.
+
+```{r }
+#fitting logit
+set.seed(987654321)
+log_model <- train(default ~ ., 
+        data = df_train,
+        method = "glm",
+        family = "binomial",
+        trControl = ctrl_cv5x3,
+        metric='ROC')
+
+
+#predicting test data
+test_log = predict(log_model,df_test,type = "prob")
+#counting AUCROC
+test_log_roc = roc(df_test$default ~ test_log[,2], plot = FALSE, print.auc = FALSE)
+#storing cross-validation AUCROC
+vec_valid <- mean(log_model$resample$ROC)
+#storing test prediction AUCROC
+vec_test <- test_log_roc$auc
+
+
+
+#Random Forest
+tgrid <- expand.grid(
+  .mtry = c(2),
+  .splitrule = "gini",
+  .min.node.size = c(150)
+) 
+set.seed(987654321)
+rf_gridsearch <- train(default ~ ., 
+                       data = df_train,
+                       method = 'ranger',
+                       metric = 'ROC',
+                       tuneGrid = tgrid,
+                       trControl = ctrl_cv5x3)
+
+test_rf = predict(rf_gridsearch,df_test,type = "prob")
+test_rf_roc = roc(df_test$default ~ test_rf[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(rf_gridsearch$resample$ROC))
+vec_test <- rbind(vec_test,test_rf_roc$auc)
+
+#linear discriminant analysis
+set.seed(987654321)
+lda_model <- train(default ~ ., 
+        data = df_train,
+        method = "lda",
+        family = "binomial",
+        trControl = ctrl_cv5x3,
+        metric='ROC')
+
+test_lda = predict(lda_model,df_test,type = "prob")
+test_lda_roc = roc(df_test$default ~ test_lda[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(lda_model$resample$ROC))
+vec_test <- rbind(vec_test,test_lda_roc$auc)
+
+#Neural Network
+set.seed(987654321)
+nnet_fit <- train(default ~., data = df_train, method = "nnet",
+                trControl=ctrl_cv5x3,
+                 maxit=3000,
+                preProcess = c('center', 'scale'),
+                metric='ROC', 
+                trace=FALSE,
+                tuneGrid=expand.grid(size=1, decay=c(0.1)))
+
+test_nn = predict(nnet_fit,df_test,type = "prob")
+test_nn_roc = roc(df_test$default ~ test_nn[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(nnet_fit$resample$ROC))
+vec_test <- rbind(vec_test,test_nn_roc$auc)
+
+#Partial Least Squared
+set.seed(987654321)
+pls_fit <- train(default ~ ., data = df_train, 
+                 method = "pls",
+                 metric='ROC',
+                 preProc = c("center", "scale"),
+                 tuneLength = 10,
+                 maxit=1000,
+                 trControl = ctrl_cv5x3
+                 )
+
+test_pls = predict(pls_fit,df_test,type = "prob")
+test_pls_roc = roc(df_test$default ~ test_pls[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(pls_fit$resample$ROC))
+vec_test <- rbind(vec_test,test_pls_roc$auc)
+
+#Extreme Gradient Boosting
+set.seed(987654321)
+tune_grid <- expand.grid(nrounds = 50,
+                        max_depth = 1,
+                        eta = 0.3,
+                        gamma = 0.5,
+                        colsample_bytree = 0.8,
+                        min_child_weight = 0.1,
+                        subsample = 0.75)
+
+xgb_fit <- train(default ~., data = df_train, method = "xgbTree",
+                trControl=ctrl_cv5x3,
+                tuneGrid = tune_grid,
+                metric='ROC')
+test_xgb = predict(xgb_fit,df_test,type = "prob")
+test_xgb_roc = roc(df_test$default ~ test_xgb[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(xgb_fit$resample$ROC))
+vec_test <- rbind(vec_test,test_xgb_roc$auc)
+
+#Adaboost
+set.seed(987654321)
+Grid <- expand.grid(maxdepth=3,nu=0.1,iter=100)
+ada_fit = train(x=df_train[,-12],y=df_train[,12], method="ada",
+                    trControl = ctrl_cv5x3,metric='ROC',
+                    tuneGrid=Grid)
+
+test_ada = predict(ada_fit,df_test,type = "prob")
+test_ada_roc = roc(df_test$default ~ test_ada[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(ada_fit$resample$ROC))
+vec_test <- rbind(vec_test,test_ada_roc$auc)
+
+#Gradient Boosting
+set.seed(987654321)
+parameters_gbm<- expand.grid(interaction.depth=1,
+                             n.trees=100,
+                             shrinkage=0.1,
+                             n.minobsinnode=10)
+gbm_fit <- train(default ~ ., data = df_train, 
+                 method = "gbm",
+                 metric='ROC',
+                 trControl = ctrl_cv5x3,
+                 tuneGrid = parameters_gbm,
+                 verbose = FALSE)
+
+test_gbm = predict(gbm_fit,df_test,type = "prob")
+test_gbm_roc = roc(df_test$default ~ test_gbm[,2], plot = FALSE, print.auc = FALSE)
+vec_valid <- rbind(vec_valid,mean(gbm_fit$resample$ROC))
+vec_test <- rbind(vec_test,test_gbm_roc$auc)
+
+
+```
+
+
+After all models are trained we are going to create matrix of results.
+```{r}
+#column binding train prediction,cross-validation and test prediction results
+df_results <- cbind(vec_valid,vec_test)
+#changing rownames
+rownames(df_results) <- c('logit','rf','lda','nn','pls', 'xgb',
+                          'ada','gbm')
+#changing colnames
+colnames(df_results) <- c('cross_validation','test')
+
+```
+
+On the plot below we can see cross-validation results. There is little difference among all methods - 0.04 AUC at most. Surprisingly tree base models did the worst. Neural network looks the best. Overall results are not too good. AUC is lower than 0.7 for the best method.
+
+```{r}
+#storing list of resamples to make dotplot of cross-validation AUCROC results 
+cvValues <- resamples(list(ada = ada_fit, nn=nnet_fit,
+                           xgb=xgb_fit,lda=lda_model,logit=log_model,
+                           rf=rf_gridsearch, gbm=gbm_fit,pls=pls_fit))
+#ploting results of models cross-validation results
+dotplot(cvValues, metric = "ROC", main = 'Cross-validation results')
+```
+
+Now let`s check how the models predict out of sample data. 
+```{r}
+#printing table of train/cross-validation/test results
+df_results %>% as.data.frame() %>% dplyr:: arrange(desc(cross_validation)) %>%
+  kableExtra::kbl(digits = 3,caption = 'AUCROC') %>%
+  kableExtra::kable_classic("striped", full_width = F)
+```
+
+We can see that test scores are better for all methods. They are greater by ~0.01 AUC. We decided to select neural network as the model to compare with best practices. It got the highest score in cross-validation and it might be fun to chceck how it relates to best practices.
+
+# Best practices
+
+## Fine classing
+
+Reading libraries
+
+```{r}
+
+library(lmtest)
+library(zoo)
+library(lattice)
+library(pROC)
+library(forcats)
+library(RColorBrewer)
+library(smbinning)
+library(sqldf)
+library(ggplot2)
+library(scales)
+library(Formula)
+library(partykit)
+library(plyr)
+library(dplyr)
+library(caTools)
+library(tidyr)
+library(gridExtra)
+library(pcaPP)
+library(ggrepel)
+library(readr)
+library(woeBinning)
+library(caTools)
+library(magrittr)
+
+```
+
+Preparing variables for fine classing.
+```{r}
+base <- df[,-13]
+#changing . to _ in names; it cause errors 
+colnames(base)[c(2,4,7,8,9,10,11,12)] <-
+  c('int_rate','log_annual_inc','days_with_cr_line','revol_bal', 'revol_util',
+    'inq_last_6mths','dealinq_2yrs','pub_rec')
+
+nums <- sapply(base, is.numeric) 
+#apply() applying function {is.numeric} to all elements of an object {base}
+base.n<-base[,nums]
+
+fact <- sapply(base, is.factor)
+base.f<-base[,fact]
+
+# DISCRETIZATION - FINE CLASSING
+
+percentile<-apply(X=base.n, MARGIN=2, FUN=function(x) round(quantile(x, seq(0.1,1,0.1), na.rm=TRUE),2))
+
+# unique values per column
+unique<-apply(base.n, MARGIN=2, function(x) length(unique(x)))
+
+# selecting only columns with more than 10 unique levels
+numeric<-colnames(base.n[which(unique>=10)])
+#<10 levels
+num_as_fact<-colnames(base.n[which(unique<10 & unique>1 )])
+
+```
+
+```{r}
+# binariZation wrt percentiles 
+options(scipen=999) 
+#turning off mathematical notation
+
+# Binarization for numeric vars with >10 levels 
+
+for (m in numeric)
+  {
+  base.n[,paste(m,"_fine", sep="")]<-cut(
+    x=as.matrix(base.n[m]), 
+    breaks=c(-Inf,unique(percentile[,m])), 
+    labels =c(paste("<=",unique(percentile[,m])))
+    ) 
+  }
+
+# changing vars into factors, where levels <10 
+
+base.f[,paste(num_as_fact,"_fine",sep="")]<-sapply(base.n[,num_as_fact],as.factor)
+
+```
+
+```{r}
+
+# Weight of Evidence calculation using smbinning
+
+# in smbinning 0 means bad, --> reverting definition of gb flag
+base.n$def_woe<-ifelse(df$default=='YES',0,1)
+base.n$def<-ifelse(df$default=='YES',1,0)
+
+#List for WoE etc.
+WOE<-list()
+
+#Data frame for Information Value
+IV<-data.frame(VAR=character(), IV=integer())
+
+#Choosing vars with _fine suffix 
+base.n_fine<-base.n[ ,grepl(pattern="_fine" , x=names(base.n))]
+library(smbinning)
+
+```
+
+WOE of numeric variables.
+
+```{r}
+# Choice of vars to be analysed
+names.n<-colnames(base.n[,!names(base.n) %in% c(colnames(base.n_fine),"def","def_woe")])
+
+# style=3 fraction of task that are done
+for (i in names.n){
+  
+  # rows and columns at a chart
+  par(mfrow=c(2,2))
+  
+  
+  results<- smbinning.custom(df=base.n, y="def_woe", x=i, cuts=unique(percentile[,i]))
+  
+  # Relevant plots (2x2 Page) 
+  
+  # BOXPLOT
+  boxplot(base.n[,i]~base.n$def, 
+          horizontal=T, frame=F, col="lightgray",main="Distribution") 
+  mtext(i,3) 
+  # Frequency plot 
+  smbinning.plot(results,option="dist",sub=i)
+  # Bad rate fractions
+  smbinning.plot(results,option="badrate",sub=i) 
+  # WoE
+  smbinning.plot(results,option="WoE",sub=i)
+  
+  
+
+  # IV row binding
+  IV<-rbind(IV, as.data.frame(cbind("VAR"=i,
+              "IV"=results$ivtable[results$ivtable$Cutpoint=="Total", "IV"])))
+  
+  # Saving data 
+  d<-results$ivtable[,c("Cutpoint","WoE","PctRec")]
+  # Total row removal  
+  d<-d[d$Cutpoint!="Total",]
+  # Ordering wrt WoE - for gini etc. calculation
+  d<-d[with(d, order(d$WoE)),]
+  # Id 
+  d$numer<-11:(nrow(d)+10)
+  # Saving WoE in list 
+  WOE[[i]]<-d
+  
+} 
+
+```
+
+Looking at produced plots we can see that most of them have very well prepared Weight of Evidence. They are monotonous and linear. We will not delete any variables based on this plots. Each of them might be useful.\
+Let`s now do WOE for factors.
+
+```{r}
+
+# variables vector
+names.f<-colnames(base.f[,!names(base.f) %in% c("def","def_woe")])
+
+
+base.f$def_woe<-ifelse(df$default=='YES',0,1)
+base.f$def<-ifelse(df$default=='YES',1,0)
+
+# just in case to avoid automatic change of var type
+base.f <- data.frame(apply(base.f[names.f], 2, as.factor),def_woe=as.numeric(base.f$def_woe), def = as.numeric(base.f$def))
+base.f[sapply(base.f, is.character)] <- lapply(base.f[sapply(base.f, is.character)], 
+                                       as.factor)
+
+
+```
+
+
+```{r}
+for (i in names.f){
+  
+  #neede to join results for factors and numerics
+  base.f[,paste(i,"_fine", sep="")]<-base.f[,i]
+  
+  par(mfrow=c(2,2))
+  
+  
+  results<- smbinning.factor(df=base.f, y="def_woe", x=i, maxcat=length(unique(base.f[,i])))
+
+
+  smbinning.plot(results,option="dist",sub=i) 
+  smbinning.plot(results,option="badrate",sub=i) 
+  smbinning.plot(results,option="WoE",sub=i)
+  
+  IV<-rbind(IV, as.data.frame(cbind("VAR"=i, "IV"=results$ivtable[results$ivtable$Cutpoint=="Total", "IV"])))
+
+  d<-results$ivtable[,c("Cutpoint","WoE","PctRec")]
+ 
+  d<-d[d$Cutpoint!="Total",]
+ 
+  d<-d[with(d, order(d$WoE)),]
+  
+  d$numer<-11:(nrow(d)+10)
+  
+  WOE[[i]]<-d
+  
+} 
+
+```
+
+Looking at factors WOE, purpose needs some binning. All other factors are ok. Only population of levels in pub_rec and dealinq_2yrs is small. But their WOE is very different so they might be useful in building model.
+
+```{r}
+# Variables quality assessment
+
+# install.packages("forcats")
+library(forcats)
+# install.packages("pROC")
+library(pROC)
+
+# joining factors and numerics
+base<-cbind(base.f,base.n)
+
+```
+
+
+
+```{r results='hide'}
+
+
+# progress bar
+total_pb <- length(names(WOE))
+stats<-cbind(IV, Gini=NA, miss=NA)
+l<-"LIMIT_BAL"
+
+for (l in names(WOE)){
+  #  replacing NA's to 'Missing'  
+  base[,paste(l,"_fine", sep="")]<-fct_explicit_na(base[,paste(l,"_fine", sep="")], na_level="Missing")
+  
+  # objects need for Gini calculation
+  variable<-base[,c("def_woe", paste(l,"_fine", sep=""))]
+  woe<- WOE[[l]][c("Cutpoint", "WoE")]
+  
+  # Cutpoint values change if Factor
+  if (is.character(woe$Cutpoint)==TRUE) 
+  { 
+    woe$Cutpoint<-as.factor(gsub("= '|'", "", woe$Cutpoint))
+    woe$Cutpoint<-as.factor(woe$Cutpoint)
+  }
+  
+  
+  dat_temp<-merge(variable, woe, by.x=paste(l,"_fine", sep=""), by.y="Cutpoint", all.x=T)
+
+ # name change
+  colnames(dat_temp)[which(names(dat_temp) == "WoE")] <- paste(l, "_woe", sep="")  
+  
+  # adding WoE var to original dataset
+  base<-merge(base, woe, by.x=paste(l,"_fine", sep=""), by.y="Cutpoint", all.x=T)
+  colnames(base)[which(names(base) == "WoE")] <- paste(l, "_woe", sep="")
+  
+  #check, wheter all values have assigned WoE
+  print(c(any(is.na(dat_temp[,paste(l, "_woe", sep="")])), l))
+  
+  gini<- c(2*auc(dat_temp$def_woe,dat_temp[,paste(l, "_woe", sep="") ])-1)
+  
+  stats[stats$VAR==l, "Gini"]<-gini
+  
+  
+  miss<-1-c(nrow(dat_temp[dat_temp[,paste(l,"_fine", sep="")]!='Missing', ])/nrow(dat_temp))
+  
+  stats[stats$VAR==l, "miss"]<-miss
+  
+  
+}
+
+
+```
+
+
+```{r}
+stats %>% as.data.frame() %>% dplyr::arrange(desc(Gini)) %>%
+  kableExtra::kbl(digits = 4) %>%
+  kableExtra::kable_classic("striped", full_width = F)
+  
+  
+```
+
+Looking at variables GINI and IV we can see that pub_rec and dealinq_2yrs do not have too much discriminatory power. Both of them were also poor in previous importance using Random Forest. Many variables have GINI between 5% and 10 %. This is not perfect but with few variables we can not delete them.\
+Let`s look at correlations.
+
+```{r}
+###########################  Correlation analysis ###############################
+
+# only _woe variables
+var_to_check<-colnames(base)[grep("_woe", colnames(base))]
+# exclusion of def_woe
+var_to_check<-var_to_check[-c(1,2)]
+base_kor<-base[,var_to_check]
+
+library(pcaPP)
+kendall2 <-cor.fk(na.omit(base_kor))
+corrplot::corrplot.mixed(kendall2,
+               upper = "square",
+               lower = "number",
+               tl.col="black", # color of labels (variable names)
+               tl.pos = "lt")
+
+```
+
+One more time FICO is suspicious. But we will not delete it because of shortage in variables. 
+
+```{r}
+# choice of variables that will be used in coarse classing
+
+corr_list<-data.frame()
+
+# ordering correlation matrix wrt Gini (rows & columns)
+    #woe var creation
+  stats$VARW<-paste(stats$VAR,"_woe",sep="")
+    # merging statistics & correlation results
+  stat<-merge(x = stats, y = kendall2, by.x = "VARW",by.y="row.names",all.y=T)
+    #ordering wrt Gini - descending
+  stat<-stat[ order(-stat[,"Gini"]), ]
+    #changing row names as variables names
+  row.names(stat)<-stat[,1]
+    #only correlation matrix
+  stat<-stat[6:length(stat[1,])]
+    #vector of names
+  cols<-row.names(stat[,])
+    #coloum ordering wrt Gini
+  stat<-stat[cols]
+    
+    #if no correlation (missings) then small value of correlation assigning, 
+    #that won't delete var from the analysis
+  temp_k<-stat
+  temp_k<-replace(temp_k, is.na(temp_k), 0.000001000)
+ # 
+  # loop reapet()
+  # it works till stop
+  
+  # install.packages("plyr")
+  library(plyr)
+  threshold<-0.7
+  
+repeat{
+  #even though this condistion is at the beggining, it has rather final character 
+  # condition to stop a loop is reduction to NULL object
+  # it may happend when in the last loop all variables satisfy a condition
+  # > threshold 
+  if (length(temp_k)<1) {
+    break
+  }
+  
+    # selection of all variables that correlation with a first variable is higher than threshold
+    # NOTE: correlation coefficient between variable and  itself is equal 1 so it wuold be taken into data frame
+  row_k<-abs(temp_k[1,]) > threshold
+  row_k[1]<-TRUE
+  
+    # condition checkig wheter we are at the end of the analysis
+    # if not then vars that > threshold is satisfied are taken
+    # in yes the final variable is taken
+  if(length(row_k)>1){
+    row_k2<-row_k[,row_k]
+  }else{row_k2<-row_k}
+  
+    # from temp_k all rows kept in row_k2 are deleted
+    
+  temp_k<-as.data.frame(temp_k[!t(row_k),!row_k])
+  
+    #if only one variable remains then R would reduce DF to vector and names for rows and columns have to be defined
+  if(length(temp_k)==1){ 
+    colnames(temp_k)<- dimnames(row_k)[[2]][-which(row_k)]
+    rownames(temp_k)<- dimnames(row_k)[[2]][-which(row_k)]
+  }
+  
+  
+    #creation of vecotr with variables that satisfy > threshold
+  if(length(row_k2)==1) {
+    variable<-row.names(row_k)
+    namess<-as.data.frame(variable)
+  }
+  
+  if(length(row_k2)>1) {
+    row_k2<-row_k2[2:length(row_k2)]
+    row_k2<-as.data.frame(t(row_k2))
+    namess<-colnames(row_k2)
+    namess<-as.data.frame(t(namess))
+    row.names(namess) <- row.names(row_k)
+    variable<-row.names(row_k)
+    variable<-as.data.frame(variable)
+    namess<-merge(variable,namess)
+  }
+  
+  
+    # adding to corr_list row with all correlated vars with the variable
+    # rbind.fill() - filling missing columns with NA
+  
+    corr_list<-rbind.fill(corr_list,namess)
+  
+    # condition to leave a loop - when last variable left
+    
+  if(length(temp_k)==1){ 
+    variable<-dimnames(row_k)[[2]][-which(row_k)]
+    namess<-as.data.frame(variable)
+    corr_list<-rbind.fill(corr_list,namess)
+    break}
+  
+}
+
+```
+
+```{r}
+
+ # merging of data with stats and correlations
+  all<-merge(x = stats, y = corr_list, by.x = "VARW",by.y="variable",all.y=T)
+    # ordering by Gini
+  all<-all[ order(-all[,"Gini"]), ]
+   # exclusion of variables with gini below 0.1
+  all<-all[all$Gini>0.05,]
+  
+  base_coarse<-base[-grep("_fine",colnames(base))]
+  #kols<-c(as.character(all$VAR),"def","def_woe")
+  kols<-c(as.character(all$VAR),"def","def_woe")
+  base_coarse<-base_coarse[kols]
+  
+```
+
+As our data is ready to use, we will partition it into 70% train and 30% test in the same way as before.
+```{r}
+set.seed(987654321)
+#splitting data
+train <- df[data_which_train,] 
+#changing . to _ in colnames
+colnames(train) <- gsub("[.]",'_',colnames(train))
+
+#selecting colnames and creating def and def_woe
+c_names <- colnames(base_coarse)
+c_names <- c_names[1:10]
+train <- train %>% select(c_names)
+train$def <- ifelse(df_train$default=='YES',1,0)
+train$def_woe <- ifelse(df_train$default=='YES',0,1)
+
+#selecting colnames and creating def and def_woe
+test <- df[-data_which_train,]
+colnames(test) <- gsub("[.]",'_',colnames(test))
+test <- test %>% select(c_names)
+test$def <- ifelse(df_test$default=='YES',1,0)
+test$def_woe <- ifelse(df_test$default=='YES',0,1)
+table(train$def)/nrow(train)
+table(test$def)/nrow(test)
+
+```
+
+
+## Coarse classing
+
+
+```{r}
+library(zoo)
+library(lattice) #charts
+
+library(pROC) # gini etc
+library(forcats) #NA for Missing
+library(RColorBrewer) #color pallete
+
+library(ggplot2)
+library(scales)
+library(tidyr)
+library(gridExtra)
+library(pcaPP)
+library(ggrepel)
+library(readr)
+
+library(smbinning) #smbinning
+
+# install.packages("InformationValue")
+library(InformationValue)
+
+
+# install.packages("woeBinning") #woeBinning
+library(woeBinning)
+
+# install.packages("plyr") #revalue
+library(dplyr)
+library(plyr)
+```
+
+
+```{r}
+resetPar <- function() {
+  dev.new()
+  op <- par(no.readonly = TRUE)
+  dev.off()
+  op
+}
+
+
+par(resetPar()) 
+par(xpd = T, mfrow=c(1,1))
+```
+
+```{r}
+# COARSE CLASSING --------------------------------------------------------
+
+columns<-colnames(train)[-which(names(train) %in% c("def","def_woe"))]
+
+
+nums <- sapply(train[,columns], is.numeric) 
+
+columns.n<-columns[nums==T]
+
+source("ivmult.r")
+```
+
+```{r}
+
+temp<-data.frame(VAR=character(), VALUE=integer())
+stats<-data.frame(VAR=character(), IV=integer(),Gini=integer(), MISS=integer(),IV_val=integer(),Gini_val=integer(), MISS_val=integer())
+
+
+#cut offs for testing data
+cut_offs<-data.frame(VAR=character(), cuts=integer())
+
+################################
+# For loop applying bins to numerical variables (columns.n)
+k<-0
+
+
+for (zmienna_c in columns.n){
+  
+  
+  k<-k+1
+  par(xpd = T, mar = par()$mar, mfrow=c(1,1))
+
+  # woe.binning using decision tree
+  # Optimal Binning categorizes a numeric characteristic into bins for ulterior usage in scoring modeling. 
+  # This process, also known as supervised discretization, utilizes Recursive Partitioning to 
+  # categorize the numeric characteristic.
+  # The specific algorithm is Conditional Inference Trees which initially excludes missing values (NA) 
+  # to compute the cutpoints, adding them back later in the process for the calculation of the Information Value.
+  
+  
+  # if zmienna_c is of type character then convert it to factor
+  if (class(train[,c(zmienna_c)])[1]=="character"){train[,c(zmienna_c)]<-as.factor(train[,c(zmienna_c)])}
+  
+  # applying woe.tree.binning() function;
+  # if calculated parameter min.perc.total is out of accepted range, the default value of 0.01 is set
+  result <- woe.tree.binning(train, "def", zmienna_c, min.perc.total=0.1,min.perc.class=0.05, event.class=1)
+
+  
+  # if object result was created and information value of the variable is higher that 0 then continue
+  if(length(result)>1&result[[3]]>0){
+
+    # saving information value of variable to IV object
+    IV<-result[[3]]
+    # woe.binning.deploy function applies the binning solution generated to original data (train)
+    # it creates two new variables: one with cuts (zmienna_c.binned) and one with woe score (woe.zmienna_c.binned)
+    train<-woe.binning.deploy(train, result, add.woe.or.dum.var="woe")
+    train[,paste0("woe.",zmienna_c,".binned")]<-train[,paste0("woe.",zmienna_c,".binned")]/100
+    # Gini calculation based on woe values
+    # with missing values but replaced with -2 or 2 respecitively
+    train[,paste0("woe.",zmienna_c,".binned")]<-ifelse(train[,paste0("woe.",zmienna_c,".binned")]==-Inf,-2,train[,paste0("woe.",zmienna_c,".binned")])
+    train[,paste0("woe.",zmienna_c,".binned")]<-ifelse(train[,paste0("woe.",zmienna_c,".binned")]==Inf,2,train[,paste0("woe.",zmienna_c,".binned")])
+    gini <- 2*pROC::auc(train[,"def"], train[,paste0("woe.",zmienna_c,".binned")],direction=">")-1
+    # % missings
+    miss <- 1-nrow(train[!(is.na(train[,zmienna_c])),])/nrow(train)
+    # appending stats dataset with obtained statistics
+    
+
+    # woe.binning.deploy function applies the binning solution generated to original data (train)
+    # it creates two new variables: one with cuts (zmienna_c.binned) and one with woe score (woe.zmienna_c.binned)
+    test<-woe.binning.deploy(test, result, add.woe.or.dum.var="woe")
+    test[,paste0("woe.",zmienna_c,".binned")]<-test[,paste0("woe.",zmienna_c,".binned")]/100
+    # Gini calculation based on woe values
+    # with missing values but replaced with -2 or 2 respecitively
+    test[,paste0("woe.",zmienna_c,".binned")]<-ifelse(test[,paste0("woe.",zmienna_c,".binned")]==-Inf,-2,test[,paste0("woe.",zmienna_c,".binned")])
+    test[,paste0("woe.",zmienna_c,".binned")]<-ifelse(test[,paste0("woe.",zmienna_c,".binned")]==Inf,2,test[,paste0("woe.",zmienna_c,".binned")])
+    giniw <- 2*auc(test[,"def"], test[,paste0("woe.",zmienna_c,".binned")],direction=">")-1
+    # saving information value of variable to IV object
+    source("ivmult.r")
+    IVw<-IV(X=test[,paste0(zmienna_c,".binned")], Y=test$def)[1]
+    # % missings
+    missw <- 1-nrow(test[!(is.na(test[,zmienna_c])),])/nrow(test)
+    # appending stats dataset with obtained statistics
+    
+    
+    stats <- rbind(stats, 
+                   as.data.frame(cbind("VAR"=zmienna_c, "IV"=result[[3]],"Gini"=gini, "MISS"=miss,"IV_val"=IVw,"Gini_val"=giniw, "MISS_val"=missw)))
+    
+    # WoE and default rate per created bucket
+    mixed <- c("#cccccc","#e6e6e6","#cccccc","#e6e6e6","#cccccc","#e6e6e6","#cccccc","#e6e6e6","#cccccc","#e6e6e6")
+    
+    plot<-data.frame(result[[2]])
+    plot$bins <- rownames(plot)
+    plot$woe<-plot$woe/100
+    plot$woe<-ifelse(plot$woe==Inf, -2, ifelse(plot$woe==-Inf, -2,plot$woe))
+    plot$woe<-ifelse(rownames(plot)=="Missing"&plot$woe>3,0,plot$woe)
+    plot$woe<-ifelse(rownames(plot)=="Missing"&plot$woe<(-3),0,plot$woe)
+    plot <- na.omit(plot)
+    plot <- plot %>% filter(X1+X0>0)
+    
+    plot$woe_plot <- paste0('WoE=', round(plot$woe,2))
+    plot$fill_plot <- paste0('Fill=', round(((plot$X1+plot$X0)/sum(plot$X1+plot$X0)),2))
+    plot$GoodRate<-plot$X1/plot$X0
+    
+
+    plot$bins <- factor(plot$bins)
+    plot$bins <- fct_reorder(plot$bins, plot$cutpoints.final, min)
+
+    plot_1 <- ggplot(plot, aes(x=bins, y=woe)) +
+      geom_bar(stat = "identity", fill=mixed[1:length(unique(plot$cutpoints.final..1.))]) +
+      geom_line(aes(x = bins, y = GoodRate), group=1, color="#333333") +
+      geom_text_repel(aes(x = bins, y = GoodRate, label=scales::percent(GoodRate)), vjust = -0.6, size=2) +
+      geom_text_repel(aes(label=woe_plot), vjust = 1, size=2) +
+      geom_text_repel(aes(label=fill_plot), vjust= -0.5, size=2) +
+      scale_y_continuous(sec.axis = sec_axis(~., labels = function(b) {paste0(round(b * 100, 0), "%")})) +
+      theme_minimal() +
+      labs(title ="WoE and default rate per bucket", subtitle=zmienna_c) +
+      theme(
+            plot.title = element_text(hjust = 0.5, size = 9),
+            plot.subtitle = element_text(hjust = 0.5, size = 9),
+            axis.text = element_text(size = 7)) 
+ 
+    print(plot_1)
+  }
+  
+  # for wchich vars woe was calculated
+  temp<-rbind(temp, as.data.frame(cbind(VAR=zmienna_c,VALUE=length(result)>1 )))
+  names(temp)<-c("VAR","VALUE")
+}
+
+```
+
+We can see that many variables were very well coarsed. Only in revol_util and revol_bal there is no linear relationship among bins. Later we will use stepwise regression so they probably will be deleted.\
+Now let`s look at coarsing of factors. We have only one factor - purpose.
+
+
+```{r}
+
+columns.f <- c("purpose") 
+
+```
+   
+  
+```{r}
+# progress bar
+
+################################
+# For loop applying bins to numerical variables (columns.n)
+k<-0
+
+
+for (zmienna_c in columns.f){
+  
+  
+  k<-k+1
+  par(xpd = T, mar = par()$mar, mfrow=c(1,1))
+
+  # woe.binning using decision tree
+  # Optimal Binning categorizes a numeric characteristic into bins for ulterior usage in scoring modeling. 
+  # This process, also known as supervised discretization, utilizes Recursive Partitioning to 
+  # categorize the numeric characteristic.
+  # The specific algorithm is Conditional Inference Trees which initially excludes missing values (NA) 
+  # to compute the cutpoints, adding them back later in the process for the calculation of the Information Value.
+  
+  
+  # if zmienna_c is of type character then convert it to factor
+  if (class(train[,c(zmienna_c)])[1]=="character"){train[,c(zmienna_c)]<-as.factor(train[,c(zmienna_c)])}
+  
+  # applying woe.tree.binning() function;
+  # if calculated parameter min.perc.total is out of accepted range, the default value of 0.01 is set
+  result <- woe.tree.binning(train, "def", zmienna_c, min.perc.total=0.1,min.perc.class=0.05, event.class=1)
+
+  
+  # if object result was created and information value of the variable is higher that 0 then continue
+  if(length(result)>1&result[[3]]>0){
+   
+
+    # saving information value of variable to IV object
+    IV<-result[[3]]
+    # woe.binning.deploy function applies the binning solution generated to original data (train)
+    # it creates two new variables: one with cuts (zmienna_c.binned) and one with woe score (woe.zmienna_c.binned)
+    train<-woe.binning.deploy(train, result, add.woe.or.dum.var="woe")
+    train[,paste0("woe.",zmienna_c,".binned")]<-train[,paste0("woe.",zmienna_c,".binned")]/100
+    # Gini calculation based on woe values
+    # with missing values but replaced with -2 or 2 respecitively
+    train[,paste0("woe.",zmienna_c,".binned")]<-ifelse(train[,paste0("woe.",zmienna_c,".binned")]==-Inf,-2,train[,paste0("woe.",zmienna_c,".binned")])
+    train[,paste0("woe.",zmienna_c,".binned")]<-ifelse(train[,paste0("woe.",zmienna_c,".binned")]==Inf,2,train[,paste0("woe.",zmienna_c,".binned")])
+    gini <- 2*pROC::auc(train[,"def"], train[,paste0("woe.",zmienna_c,".binned")],direction=">")-1
+    # % missings
+    miss <- 1-nrow(train[!(is.na(train[,zmienna_c])),])/nrow(train)
+    # appending stats dataset with obtained statistics
+    
+
+    # woe.binning.deploy function applies the binning solution generated to original data (train)
+    # it creates two new variables: one with cuts (zmienna_c.binned) and one with woe score (woe.zmienna_c.binned)
+    test<-woe.binning.deploy(test, result, add.woe.or.dum.var="woe")
+    test[,paste0("woe.",zmienna_c,".binned")]<-test[,paste0("woe.",zmienna_c,".binned")]/100
+    # Gini calculation based on woe values
+    # with missing values but replaced with -2 or 2 respecitively
+    test[,paste0("woe.",zmienna_c,".binned")]<-ifelse(test[,paste0("woe.",zmienna_c,".binned")]==-Inf,-2,test[,paste0("woe.",zmienna_c,".binned")])
+    test[,paste0("woe.",zmienna_c,".binned")]<-ifelse(test[,paste0("woe.",zmienna_c,".binned")]==Inf,2,test[,paste0("woe.",zmienna_c,".binned")])
+    giniw <- 2*auc(test[,"def"], test[,paste0("woe.",zmienna_c,".binned")],direction=">")-1
+    # saving information value of variable to IV object
+    source("ivmult.r")
+    IVw<-IV(X=test[,paste0(zmienna_c,".binned")], Y=test$def)[1]
+    # % missings
+    missw <- 1-nrow(test[!(is.na(test[,zmienna_c])),])/nrow(test)
+    # appending stats dataset with obtained statistics
+    
+    
+    stats <- rbind(stats, 
+                   as.data.frame(cbind("VAR"=zmienna_c, "IV"=result[[3]],"Gini"=gini, "MISS"=miss,"IV_val"=IVw,"Gini_val"=giniw, "MISS_val"=missw)))
+    
+    # WoE and default rate per created bucket
+    mixed <- c("#cccccc","#e6e6e6","#cccccc","#e6e6e6","#cccccc","#e6e6e6","#cccccc","#e6e6e6","#cccccc","#e6e6e6")
+    
+      plot<-data.frame(result[[2]])
+      plot$woe<-ifelse(plot$woe==Inf, -2, ifelse(plot$woe==-Inf, -2,plot$woe))
+      plot$woe<-plot$woe/100
+      plot <- na.omit(plot)
+      plot <- plot %>% dplyr::select(-Group.1) %>% distinct()
+
+      plot$woe_plot <- paste0('WoE=', round(plot$woe,2))
+      plot$fill_plot <- paste0('Fill=', round(((plot$X1+plot$X0)/sum(plot$X1+plot$X0)),2))
+      plot$GoodRate <- ifelse(is.na(plot$X0),1,(plot$X1)/(plot$X1+plot$X0))
+      
+      plot$Group.2 <- fct_reorder(plot$Group.2, plot$woe, min)
+      
+      plot_1 <- ggplot(plot, aes(x=Group.2, y=woe)) +
+        geom_bar(stat = "identity", fill=mixed[1:length(unique(plot$woe))]) +
+        geom_line(aes(x = Group.2, y = GoodRate), group=1, color="#333333") +
+        geom_text_repel(aes(x = Group.2, y = GoodRate, label=scales::percent(GoodRate)), vjust = -0.6, size=2) +
+        geom_text_repel(aes(label=woe_plot), vjust = 1, size=2) +
+        geom_text_repel(aes(label=fill_plot), vjust= -0.5, size=2) +
+        scale_y_continuous(sec.axis = sec_axis(~., labels = function(b) {paste0(round(b * 100, 0), "%")})) +
+        theme_minimal() +
+        labs(title ="WoE and default rate per bucket", subtitle=zmienna_c) +
+        theme(axis.title.x = element_blank(),
+              plot.title = element_text(hjust = 0.5, size = 9),
+              plot.subtitle = element_text(hjust = 0.5, size = 9),
+              axis.text = element_text(size = 7)) 
+    print(plot_1)
+  }
+  
+  # for wchich vars woe was calculated
+  temp<-rbind(temp, as.data.frame(cbind(VAR=zmienna_c,VALUE=length(result)>1 )))
+  names(temp)<-c("VAR","VALUE")
+
+}
+
+
+```
+
+
+Purpose was very well coarsed. Now we will move to modeling as our data is quite well prepared.
+
+## Modeling
+
+Reading libraries
+```{r}
+
+library(leaps) #subsetting selection  
+library("VSURF")
+library(LogisticDx) # - gof()
+library(pROC) # - auc(), roc.test itp.
+library(gtools) # smartbind()
+
+```
+
+```{r}
+############################
+
+#Functions needed for quality assessment
+
+hosmerlem = function(y, yhat, g=20) {
+  cutyhat = cut(yhat,breaks = quantile(yhat, probs=seq(0,1, 1/g)), include.lowest=TRUE)  
+  obs = xtabs(cbind(1 - y, y) ~ cutyhat)  
+  expect = xtabs(cbind(1 - yhat, yhat) ~ cutyhat)  
+  chisq = sum((obs - expect)^2/expect)  
+  P = 1 - pchisq(chisq, g - 2)  
+  return(list(chisq=chisq,p.value=P))
+  hr=P
+}
+
+cal_psi <- function(data1,data2, bench, target, bin)
+{
+  ben<-sort(data1[,bench]);
+  tar<-sort(data2[,target]);
+  # get and sort benchmark and target variable
+  ttl_bench<-length(ben);
+  ttl_target<-length(tar);
+  # get total num obs for benchmark and target
+  n<-ttl_bench%/%bin; #Num of obs per bin
+  psi_bin<-rep(0,times=bin) #initialize PSI=0 for each bin
+  
+  for (i in 1:bin) # calculate PSI for ith bin
+  {
+    
+    lower_cut<-ben[(i-1)*n+1];
+    if(i!=bin){upper_cut<-ben[(i-1)*n+n]; pct_ben<-n/ttl_bench;} else
+    {upper_cut<-ben[ttl_bench];
+    pct_ben<(ttl_bench-n*(bin-1))/ttl_bench;}
+    #last bin should have all remaining obs
+    
+    pct_tar<-length(tar[tar>lower_cut&tar<=upper_cut])/ttl_target;
+    psi_bin[i]<-(pct_tar-pct_ben)*log(pct_tar/pct_ben);
+  }
+  psi<-sum(psi_bin);
+  return(psi);
+}
+
+
+cal_psi_zm <- function(data1,data2, bench, target)
+{
+  ben<-sort(data1[,bench]);
+  tar<-sort(data2[,target]);
+  bin<-length(unique(ben))
+  bin_tar<-length(unique(tar))
+  # get and sort benchmark and target variable
+  ttl_bench<-length(ben);
+  ttl_target<-length(tar);
+  # get total num obs for benchmark and target
+  tab_ben<-table(ben)
+  pct_ben<-tab_ben/ttl_bench
+  names<-names(tab_ben)
+  tab_tar<- as.data.frame(table(tar))
+  
+  
+  tab_tar<-merge(as.data.frame(tab_ben),tab_tar,by.x="ben",by.y="tar")
+  tab_tar[,is.na(tab_tar)]<-0
+ 
+  pct_tar<-tab_tar[,3]/ttl_target
+  pct_ben<-tab_tar[,2]/ttl_bench
+  psi_bin<-rep(0,times=bin) #initialize PSI=0 for each bin
+  
+  psi_bin<-(pct_tar-pct_ben)*log(pct_tar/pct_ben);
+  psi<-sum(psi_bin);
+  return(psi);
+}
+```
+
+Selecting woe colnames and building base model with intercept only and max model with all variables.
+```{r}
+#list of names with _woe
+colss<-colnames(train)[grep("woe", colnames(train))]
+colss<-colss[-grep("def_woe", colss)]
+data<-train[,c("def",colss)]
+
+baza<-glm(def ~ 1,data=data, family=binomial("logit"))
+
+max<-glm(def ~ .,data=data, family=binomial("logit"))
+summary(max)
+
+```
+
+Most of the variables are significant.
+The best model will be chosen using stepwise method.
+```{r}
+###########################################################
+
+# MODEL ESTIMATION
+############ STEPWISE
+
+model_stepwise_both<-step(baza, scope = list(upper=max, lower=baza ), direction = "both", trace=F,steps=30,k=4)
+
+summary(model_stepwise_both)
+
+```
+
+Using stepwise regression 7 out of 10 variables were chosen. Let`s compare now stepwise model and neural network.
+
+## Comparison
+
+```{r}
+mdl<-"model_stepwise_both"
+model<-model_stepwise_both
+
+#storing nn predictions
+train_nn <- predict(nnet_fit,type='prob')
+data$nn <- train_nn[,2]
+test$nn <- test_nn[,2]
+
+################################################################################
+
+data$baza<-baza$fitted.values
+data$model<-model$fitted.values
+data$max<-max$fitted.values
+
+#predicting stepwise
+test$model<-predict(model, newdata=test, type="response") 
+train$model<-predict(model, newdata=train, type="response")
+
+```
+
+Firstly let`s inspect AUC scores of 4 models, max,basic, stepwise and nn on train data.
+
+```{r}
+#counting AUC
+b1<-ci.auc(data$def, data$baza,method="d",direction="<")
+b2<-ci.auc(data$def, data$max,method="d",direction="<")
+b3<-ci.auc(data$def, data$model,method="d",direction="<")
+b4<-ci.auc(data$def, data$nn,method="d",direction="<")
+
+#creating matrix of values
+por_1 <- rbind(b1,b2,b3,b4)
+colnames(por_1) <- c(0.025,0.5,0.975)
+rownames(por_1) <- c('baza','max',mdl,'nn')
+
+#printing fancy table
+por_1 %>% as.data.frame()  %>%
+  kableExtra::kbl(digits = 4,caption = 'AUC') %>%
+  kableExtra::kable_classic("striped", full_width = F)
+
+```
+
+We can see that AUC for stepwise model is not that different from max model. Neural network AUC is only 0.01 higher than max and stepwise model. All of AUC results are not that great. Let`s now perform roc.test to check if they are statistically different. 
+
+```{r}
+#Roc test for stepwise
+a <- roc.test(data$def, data$model, data$baza,method="d")$p.value
+b <- roc.test(data$def, data$max, data$model,method="d")$p.value
+#Roc test for nn
+c <-roc.test(data$def, data$nn, data$baza,method="d")$p.value
+d <-roc.test(data$def, data$max, data$nn,method="d")$p.value
+#creating matrix
+comp_1 <- rbind(cbind(a,b),cbind(c,d))
+rownames(comp_1) <- c(mdl,'nn')
+colnames(comp_1) <- c('vs baza', 'vs max')
+#Fancy printing
+comp_1 %>% as.data.frame()  %>%
+  kableExtra::kbl(digits = 4,caption = 'P-value') %>%
+  kableExtra::kable_classic("striped", full_width = F)
+
+```
+
+We can see that both stepwise and nn are different than base model. That`s good. Moreover we can see that also both of them are not different than max model. Let s now check if nn is different to stepwise.
+
+```{r}
+roc.test(data$def, data$nn, data$model,method="d")$p.value
+```
+
+We can see that using 5% significance level there is no difference between them. Although p-value is small ~0.06.\
+Let`s now print GINI score of models. GINI is just a linear transformation of AUC, so we can use our previous results.
+
+```{r}
+(2*por_1-1) %>% as.data.frame()  %>%
+  kableExtra::kbl(digits = 4,caption = 'GINI') %>%
+  kableExtra::kable_classic("striped", full_width = F)
+```
+
+GINI for whole model should be at least greater than 35%. For stepwise it is equal to 32,4% and for nn 34,8%. So we can say that both models are rather poor.\
+Let`s now check K-S statistics.
+
+```{r}
+k1 <- ks.test(data[data$def==0,c("model")],data[data$def==1,c("model")])$statistic
+k2 <- ks.test(test[test$def==0,c("model")],test[test$def==1,c("model")])$statistic
+k3 <- ks.test(data[data$def==0,c("nn")],data[data$def==1,c("nn")])$statistic
+k4 <- ks.test(test[test$def==0,c("nn")],test[test$def==1,c("nn")])$statistic
+#creating matrix
+k_comp <- rbind(cbind(k1,k2),cbind(k3,k4))
+rownames(k_comp) <- c(mdl,'nn')
+colnames(k_comp) <- c('train', 'test')
+
+k_comp %>% as.data.frame()  %>%
+  kableExtra::kbl(digits = 4,caption = 'K-S') %>%
+  kableExtra::kable_classic("striped", full_width = F)
+
+```
+
+Komogorov-Smirnov statistic should be at least greater than 0.2 and it would be good that it would be greater than 0.35. For stepwise model it is equal to 0.235 on traning data and 0.2402 on out of sample data. Both results are similar to each other and not bad. For neural network model KS i bigger by 0.01 on training data - 0.244. Surprisingly it is much better on test that - 0.278.
+
+### Stability
+
+Now we will count Population Stability Index.
+```{r}
+ps1 <- cal_psi(data1=data, data2=test, bench="model",target="model",bin=20)
+ps2 <- cal_psi(data1=data, data2=test, bench="nn",target="nn",bin=20)
+ps_comp <- rbind(ps1,ps2)
+rownames(ps_comp) <- c(mdl,'nn')
+colnames(ps_comp) <- c('PSI')
+
+ps_comp %>% as.data.frame()  %>%
+  kableExtra::kbl(digits = 4) %>%
+  kableExtra::kable_classic("striped", full_width = F)
+```
+
+It is the best that PSI is lower than 0.1. Values greater than 0.25 indicates instability. We can see that both model pass this test, PSI for nn and stepwise are equal to 0.0066 and 0.0286.\
+Now let`s check K-S test.
+
+```{r}
+ks_1 <- ks.test(data$model,test$model)$p.value
+ks_2 <- ks.test(data$nn,test$nn)$p.value
+kst_comp <- rbind(ks_1,ks_2)
+rownames(kst_comp) <- c(mdl,'nn')
+colnames(kst_comp) <- c('K-S')
+
+kst_comp %>% as.data.frame()  %>%
+  kableExtra::kbl(digits = 4) %>%
+  kableExtra::kable_classic("striped", full_width = F)
+```
+
+In both Kolmogorov-Smirnov Tests we can not reject null hypothesis that both samples were drawn from the same distribution. P-values are greater than 5%.\
+Let`s also check 3 most frequent predictions for train and test values.
+
+```{r}
+#counting frequencies
+d_1 <- as.data.frame(sort(table(round(data$model,4))/
+                        length(round(data$model,4)),decreasing=T))[1:3,1:2]
+d_2 <- as.data.frame(sort(table(round(test$model,4))/
+                        length(round(test$model,4)),decreasing=T))[1:3,1:2]
+#creating matrix
+d_por_1 <- cbind(d_1,d_2)
+colnames(d_por_1) <- c('Var_train','Freq_train','Var_test','Freq_test')
+d_por_1 %>% as.data.frame()  %>%
+  kableExtra::kbl(digits = 4, caption = mdl) %>%
+  kableExtra::kable_classic("striped", full_width = F)
+
+```
+
+Not bad, they are not that frequent. Let`s do the same for neural network model.
+
+```{r}
+#counting frequencies
+d_3 <- as.data.frame(sort(table(round(data$nn,4))/
+                        length(round(data$nn,4)),decreasing=T))[1:3,1:2]
+d_4 <- as.data.frame(sort(table(round(test$nn,4))/
+                        length(round(test$nn,4)),decreasing=T))[1:3,1:2]
+#creating matrix
+d_por_2 <- cbind(d_3,d_4)
+colnames(d_por_2) <- c('Var_train','Freq_train','Var_test','Freq_test')
+d_por_2 %>% as.data.frame()  %>%
+  kableExtra::kbl(digits = 4, caption = 'nn') %>%
+  kableExtra::kable_classic("striped", full_width = F)
+
+```
+
+For neural network they are even less frequent. Let`s now check variable stability in each model using GINI and PSI.
+
+```{r}
+zmienne<-names(model$coefficients)[2:length(model$coefficients)]
+var_qual<-NULL
+models_qual<-NULL
+zmienne_tab<-NULL
+
+
+for (i in 1:length(zmienne)) {
+  tab<-NULL 
+  tab$model<-mdl
+  tab$v<-zmienne[i]
+  tab$gini_t<-2*ci.auc(data[!is.na(data[,zmienne[i]]),c("def")], data[!is.na(data[,zmienne[i]]),zmienne[i]],direction=">",method="d")[2]-1
+  tab$gini_w<-2*ci.auc(test[!is.na(test[,zmienne[i]]),c("def")], test[!is.na(test[,zmienne[i]]),zmienne[i]],direction=">",method="d")[2]-1
+  
+  tab$psi<-cal_psi_zm(data1=data[!is.na(data[,zmienne[i]]),zmienne], data2=test[!is.na(test[,zmienne[i]]),zmienne], bench=zmienne[i],target=zmienne[i])
+  tab<-as.data.frame(tab)
+  zmienne_tab<-rbind(zmienne_tab, tab)
+}
+
+zmienne_nn <- colnames(df_train %>% 
+                         select(-c('default','purpose','pub.rec')))
+for (i in 1:length(zmienne_nn)) {
+  tab<-NULL 
+  tab$model<-'nn'
+  tab$v<-zmienne_nn[i]
+  tab$gini_t<-(2*ci.auc(df_train[!is.na(df_train[,zmienne_nn[i]]),c("default")], df_train[!is.na(df_train[,zmienne_nn[i]]),zmienne_nn[i]],direction=">",method="d")[2]
+  -1) %>% abs()
+  tab$gini_w<-(2*ci.auc(df_test[!is.na(df_test[,zmienne_nn[i]]),c("default")], df_test[!is.na(df_test[,zmienne_nn[i]]),zmienne_nn[i]],direction=">",method="d")[2]
+  -1) %>% abs
+  
+  tab$psi<-cal_psi_zm(data1=df_train[!is.na(df_train[,zmienne_nn[i]]),zmienne_nn],
+                      data2=df_test[!is.na(df_test[,zmienne_nn[i]]),zmienne_nn],
+                      bench=zmienne_nn[i],target=zmienne_nn[i])
+  tab<-as.data.frame(tab)
+  zmienne_tab<-rbind(zmienne_tab, tab)
+}
+zmienne_tab %>% as.data.frame()  %>%
+  kableExtra::kbl(digits = 4, caption = 'Variable stability') %>%
+  kableExtra::kable_classic("striped", full_width = F)
+
+```
+
+Looking at stability of stepwise model we can see that all of them are stable when it comes to PSI. GINI for log_annual_inc and revol_bal is a little bit to low. Except that all the others are quite ok. Comparing GINI between test and validation, there are some significant differences. For example, it drops in revol_util and log_annual inc by 0.04.\
+For nn model first thing that draw our attention are very high PSI values for many variables. 4 out of 9 variables have PSI greater than 0,25. When it comes to GINI 3 variables have it lower than 5%. When it comes to GINI stability only for dti and inq.last.6mths it differs significantly.\
+At the end let`s plot AUC curves.
+
+```{r fig.width = 12}
+par(mfrow=c(1,2))
+plot(roc(data$def, data$model,ci=T), print.auc = TRUE, col = "blue", main= 'Train')
+plot(roc(data$def, data$nn,ci=T), print.auc = TRUE,col = "pink", 
+     print.auc.y = .4, add = TRUE)
+legend(1, 1, legend=c("Stepwise", "nn"),
+       col=c("blue", "pink"), lty=1, cex=1,box.lty=0)
+plot(roc(test$def, test$model,ci=T), print.auc = TRUE, col = "blue", main= 'Test')
+plot(roc(test$def, test$nn,ci=T), print.auc = TRUE,col = "pink", 
+     print.auc.y = .4, add = TRUE)
+legend(1, 1, legend=c("Stepwise", "nn"),
+       col=c("blue", "pink"), lty=1, cex=1,box.lty=0)
+```
+
+Comparing both model we can see that they do not differ too much when it comes to AUC. Their ability to classify default is very similar. They both pass most of the tests but with not very convincing manner.\ Biggest advantage of logit using WOE transformation over neural network model is variables stability. All of them have very low PSI score and GINI between train and validation are stable. 
+
+# Summary
+
+Goal of this project was to compare LOGIT with WOE and some machine learning model. First thing that got our attention is length of the code and time needed to prepare model. Building machine learning model using caret is much faster and shorter in comparison to best practices in Credit Risk. Still, we feel that we put too little attention and energy into building LOGIT with WOE.\
+When it comes to performance, AUC/GINI were very similar. Although, they were both poor. Data that we used were a little bit weird and not fully informative to us.\
+Stability analysis depict that LOGIT with WOE is a little better especially when it comes to variable stability.\
+Having in mind that logit can be fully interpretable and the difference in AUC is very small between models we would choose LOGIT with WOE as better model. Fun thing to do would be to use some XAI(Explainable Artificial Intelligence) and compare it to logit with woe estimates.
